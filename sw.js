@@ -42,6 +42,7 @@ self.addEventListener('fetch', e => {
     else e.respondWith(staleWhileRevalidate(req, TILES, 4000));
     return;
   }
+  if (u.hostname === 's3.amazonaws.com' && u.pathname.startsWith('/elevation-tiles-prod/')) { e.respondWith(cacheFirst(req, TILES, 4000)); return; }
   if (u.hostname === 'cdn.jsdelivr.net' || u.hostname === 'fonts.googleapis.com' || u.hostname === 'fonts.gstatic.com') {
     e.respondWith(cacheFirst(req, LIBS, 200));
   }

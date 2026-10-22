@@ -1,0 +1,14 @@
+name = "navigace-api"
+main = "src/index.js"
+compatibility_date = "2024-09-23"
+workers_dev = true
+
+# sdílená hlášení řidičů (policie, mobilní radar, kolona…) — schéma v schema.sql
+[[d1_databases]]
+binding = "DB"
+database_name = "navigace-hlaseni"
+database_id = "f0a8a1c7-e340-42ec-8440-8781f771a48a"
+
+# každou hodinu smazat prošlá hlášení
+[triggers]
+crons = ["17 * * * *"]

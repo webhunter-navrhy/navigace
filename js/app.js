@@ -9,8 +9,10 @@ import { planJoyride, TRACKS } from './joyride.js';
 import { Navigator, Simulator } from './nav.js';
 import * as voice from './voice.js';
 import { Recorder, stats, toGPX, drawThumb } from './record.js';
-import { settings as S, saveSettings, places, savePlaces, recents, addRecent, learned, learnSample, loadReports, saveReports, parking, trips } from './store.js';
-import { dist, bearing, cumDist, pointAt, project } from './geo.js';
+import { settings as S, saveSettings, places, savePlaces, recents, addRecent, learned, learnSample, parking, trips, lastPos } from './store.js';
+import { dist, bearing, cumDist, pointAt, project, dest } from './geo.js';
+import { REPORT_TYPES, reportType, allReports, shared, startReportSync, addReport as postReport, voteReport, canVote } from './reports.js';
+import { lookAhead } from './drive.js';
 
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -31,9 +33,10 @@ const st = {
   limit: null, limitKnown: false, routes: [], selR: null, userPicked: false, stops: [], planCtl: null, planError: null,
   nav: null, navRoute: null, navState: null, navStops: [], sim: null, simMult: 1, rally: false, joy: false, wake: null,
   joyMin: 90, joyWants: { curvy: true }, joyRoutes: null, joyMsg: '', arrived: false,
+  geo: 'wait', approx: false, drive: null, hazard: null, ask: null,
 };
 const rec = new Recorder();
-let reports = loadReports();
+let reports = allReports();
 voice.configure({ persona: S.persona, voiceURI: S.voiceURI, volume: S.volume, muted: S.muted });
 
 // ---------- vzhled ----------
@@ -47,21 +50,22 @@ function applyTheme() {
   st.theme = t;
   document.documentElement.dataset.theme = t;
   document.querySelector('meta[name=theme-color]').content = THEMES[t].ui.bg;
-  if (map) map.setStyle(buildStyle(t), { diff: false });
+  if (map) map.setStyle(buildStyle(t, S.relief), { diff: false });
 }
 let map = null;
 applyTheme();
 const C = () => THEMES[st.theme].map;
 
 // ---------- mapa ----------
+const lp = lastPos.get();
 map = new maplibregl.Map({
-  container: 'map', style: buildStyle(st.theme), center: [15.45, 49.8], zoom: 6.3, maxPitch: 70,
+  container: 'map', style: buildStyle(st.theme, S.relief), center: lp ? [lp.lon, lp.lat] : [15.45, 49.8], zoom: lp ? 14.5 : 6.3, maxPitch: 70,
   attributionControl: { compact: true }, fadeDuration: 120, maxBounds: [[7, 45.5], [24, 54]], dragRotate: true,
 });
 map.touchZoomRotate.enableRotation();
 
 const srcData = {};
-const SOURCES = ['flow', 'tlines', 'tevents', 'sections', 'cams', 'bumps', 'reports', 'trip', 'routes', 'routeJam', 'routeLabels', 'stops'];
+const SOURCES = ['acc', 'flow', 'tlines', 'tevents', 'sections', 'cams', 'bumps', 'reports', 'trip', 'routes', 'routeJam', 'routeLabels', 'stops'];
 function setData(id, data) { srcData[id] = data; const s = map.getSource(id); if (s) s.setData(data); }
 
 const IMG = {
@@ -69,7 +73,7 @@ const IMG = {
   bump: ['bump', '#ffcf3f', '#1b1b1b', '#1b1b1b'], police: ['police', '#2557d6', '#ffffff', '#ffffff'], mcam: ['cam', '#ffcf3f', '#1b1b1b', '#d4231c'],
   jam: ['jam', '#f07a3a', '#ffffff', '#ffffff'], accident: ['accident', '#e5484d', '#ffffff', '#ffffff'], closure: ['closure', '#e5484d', '#ffffff', '#ffffff'],
   works: ['works', '#f4a32e', '#1b1b1b', '#ffffff'], hazard: ['hazard', '#f4a32e', '#1b1b1b', '#ffffff'], info: ['info', '#5d6470', '#ffffff', '#ffffff'],
-  fuel: ['fuel', '#1f8a5b', '#ffffff', '#ffffff'], food: ['food', '#bf5130', '#ffffff', '#ffffff'], coffee: ['coffee', '#8a5a3c', '#ffffff', '#ffffff'], view: ['view', '#3f7d4f', '#ffffff', '#ffffff'],
+  fuel: ['fuel', '#1f8a5b', '#ffffff', '#ffffff'], parking: ['parking', '#2f6fd6', '#ffffff', '#ffffff'], food: ['food', '#bf5130', '#ffffff', '#ffffff'], coffee: ['coffee', '#8a5a3c', '#ffffff', '#ffffff'], view: ['view', '#3f7d4f', '#ffffff', '#ffffff'],
 };
 let imgCache = null;
 function pillImage(bg, border, radius) {
@@ -84,7 +88,7 @@ async function addImages() {
   for (const [k, img] of Object.entries(imgCache)) if (!map.hasImage('i-' + k)) map.addImage('i-' + k, img, { pixelRatio: 2 });
   const t = THEMES[st.theme], r = st.theme === 'rally' ? 2 : 13;
   const opts = { pixelRatio: 2, stretchX: [[14, 34]], stretchY: [[13, 19]], content: [12, 7, 36, 25] };
-  for (const [id, bg, bd] of [['pill-sel', t.map.route, t.map.routeCasing], ['pill', t.dark ? '#1b1f27' : '#fffaf2', t.dark ? '#3a3f48' : '#d3c5ac']]) {
+  for (const [id, bg, bd] of [['pill-sel', t.map.route, t.map.routeCasing], ['pill', t.dark ? '#1b1f27' : '#fffaf2', t.dark ? '#3a3f48' : '#d3c5ac'], ['shield-d', '#c8102e', '#ffffff'], ['shield', t.dark ? '#e9e6df' : '#ffffff', t.dark ? '#0b0d11' : '#8c7f6c']]) {
     if (map.hasImage(id)) map.removeImage(id);
     map.addImage(id, pillImage(bg, bd, r), opts);
   }
@@ -98,8 +102,13 @@ async function onStyle() {
   const below = map.getLayer('road-label') ? 'road-label' : undefined;
   const add = (layer, before) => { if (!map.getLayer(layer.id)) map.addLayer(layer, before); };
   const T = c.traffic, lvl = ['match', ['get', 'lvl'], 5, T[2], 4, T[1], T[0]];
-  add({ id: 'flow', type: 'line', source: 'flow', minzoom: 7, layout: { 'line-cap': 'round', 'line-join': 'round' },
-    paint: { 'line-color': lvl, 'line-width': w([[7, 1.4], [12, 3.2], [16, 6]]), 'line-offset': w([[10, 0], [14, 2.5], [17, 5]]), 'line-opacity': 0.92 } }, below);
+  // přesnost polohy
+  add({ id: 'acc', type: 'fill', source: 'acc', paint: { 'fill-color': c.route, 'fill-opacity': 0.1, 'fill-outline-color': c.route } }, below);
+  // zpomalení jen jemně a zblízka, kolony výrazně i zdálky
+  add({ id: 'flow-light', type: 'line', source: 'flow', minzoom: 11.5, filter: ['==', ['get', 'lvl'], 3], layout: { 'line-cap': 'round', 'line-join': 'round' },
+    paint: { 'line-color': T[0], 'line-width': w([[11.5, 1.2], [14, 2.4], [17, 4.5]]), 'line-offset': w([[11.5, 0.5], [14, 2.5], [17, 5]]), 'line-opacity': 0.7 } }, below);
+  add({ id: 'flow', type: 'line', source: 'flow', minzoom: 7, filter: ['>=', ['get', 'lvl'], 4], layout: { 'line-cap': 'round', 'line-join': 'round' },
+    paint: { 'line-color': lvl, 'line-width': w([[7, 1.6], [12, 3.4], [16, 6.5]]), 'line-offset': w([[10, 0], [14, 2.5], [17, 5]]), 'line-opacity': 0.95 } }, below);
   add({ id: 'tlines', type: 'line', source: 'tlines', minzoom: 8, filter: ['any', ['!=', ['get', 'kind'], 'closure'], ['==', ['get', 'full'], 1]], layout: { 'line-cap': 'round' },
     paint: { 'line-color': T[2], 'line-width': w([[8, 2], [14, 5]]), 'line-dasharray': [1.2, 1.2] } }, below);
   add({ id: 'sections', type: 'line', source: 'sections', minzoom: 9,
@@ -116,6 +125,17 @@ async function onStyle() {
     paint: { 'line-color': c.route, 'line-width': w([[6, 4], [12, 6.5], [17, 13]]) } }, below);
   add({ id: 'route-jam', type: 'line', source: 'routeJam', layout: { 'line-cap': 'round', 'line-join': 'round' },
     paint: { 'line-color': lvl, 'line-width': w([[6, 4], [12, 6.5], [17, 13]]) } }, below);
+  // pumpy od z14, parkoviště až zblízka (ve městě by jinak zaplavila mapu)
+  for (const [id, cls, mz, ic] of [['poi', 'fuel', 13.5, 'i-fuel'], ['poi-park', 'parking', 16.2, 'i-parking']]) add({ id, type: 'symbol', source: 'omt', 'source-layer': 'poi', minzoom: mz, filter: ['==', ['get', 'class'], cls],
+    layout: { 'icon-image': ic, 'icon-size': ['interpolate', ['linear'], ['zoom'], 14, 0.4, 17, 0.58], 'symbol-sort-key': ['get', 'rank'],
+      'text-field': ['step', ['zoom'], '', 15.5, ['coalesce', ['get', 'name:cs'], ['get', 'name']]], 'text-font': ['Noto Sans Regular'], 'text-size': 11, 'text-offset': [0, 1.3], 'text-anchor': 'top', 'text-optional': true },
+    paint: { 'text-color': c.label, 'text-halo-color': c.halo, 'text-halo-width': 1.4 } });
+  add({ id: 'road-shield', type: 'symbol', source: 'omt', 'source-layer': 'transportation_name', minzoom: 7,
+    filter: ['all', ['has', 'ref'], ['<=', ['length', ['get', 'ref']], 6], ['match', ['get', 'class'], ['motorway', 'trunk', 'primary'], true, false]],
+    layout: { 'symbol-placement': 'line', 'symbol-spacing': ['step', ['zoom'], 260, 11, 420], 'text-field': ['get', 'ref'], 'text-font': ['Noto Sans Bold'], 'text-size': 10.5,
+      'text-rotation-alignment': 'viewport', 'icon-rotation-alignment': 'viewport', 'icon-image': ['case', ['==', ['slice', ['get', 'ref'], 0, 1], 'D'], 'shield-d', 'shield'],
+      'icon-text-fit': 'both', 'icon-text-fit-padding': [1, 4, 1, 4] },
+    paint: { 'text-color': ['case', ['==', ['slice', ['get', 'ref'], 0, 1], 'D'], '#ffffff', '#1b1b1b'] } });
   add({ id: 'bumps', type: 'symbol', source: 'bumps', minzoom: 14.5, layout: { 'icon-image': 'i-bump', 'icon-size': 0.62, 'icon-allow-overlap': true } });
   add({ id: 'cams', type: 'symbol', source: 'cams', minzoom: 10,
     layout: { 'icon-image': ['match', ['get', 'kind'], 'cam', 'i-cam', 'sec', 'i-sec', 'i-secEnd'], 'icon-size': w([[10, 0.6], [15, 0.9]]), 'icon-allow-overlap': true,
@@ -144,6 +164,7 @@ map.on('style.load', onStyle);
 function applyVisibility() {
   const vis = (ids, on) => ids.forEach(id => map.getLayer(id) && map.setLayoutProperty(id, 'visibility', on ? 'visible' : 'none'));
   vis(['flow', 'tlines', 'tevents', 'tevents-minor'], S.showTraffic);
+  vis(['flow-light'], S.showTraffic && st.mode !== 'nav');
   vis(['cams', 'sections'], S.showCams);
   vis(['bumps'], S.showBumps);
 }
@@ -157,7 +178,7 @@ function mapListeners() {
     toast({ icon: KIND_ICON[ev.kind] || 'info', title: ev.title || kindName(ev.kind), sub: [ev.road, ev.loc, ev.to ? 'do ' + ev.to : ''].filter(Boolean).join(' · '), ms: 7000, danger: ev.kind === 'closure' || ev.kind === 'accident' });
   });
   map.on('click', 'cams', e => { const p = e.features[0].properties; toast({ icon: 'cam', title: p.kind === 'cam' ? 'Radar' : p.kind === 'sec' ? 'Začátek úsekového měření' : 'Konec úsekového měření', sub: p.ms ? `limit ${p.ms} km/h` : '' }); });
-  map.on('click', 'reports', e => { const p = e.features[0].properties, R = REPORTS.find(x => x.type === p.type); toast({ icon: R ? R.icon : 'flag', title: R ? R.label : 'Hlášení', sub: 'nahlášeno ' + ago(p.t) }); });
+  map.on('click', 'reports', e => { const id = String(e.features[0].properties.id), r = reports.find(x => String(x.id) === id); r && openRepInfo(r); });
   for (const id of ['route-alt', 'route-labels', 'tevents', 'tevents-minor', 'cams', 'reports']) {
     map.on('mouseenter', id, () => { map.getCanvas().style.cursor = 'pointer'; });
     map.on('mouseleave', id, () => { map.getCanvas().style.cursor = ''; });
@@ -222,52 +243,169 @@ function setPuck(p, brg) {
   };
   requestAnimationFrame(step);
 }
+// poslední známá poloha hned po spuštění (šedě, dokud nepřijde čerstvá)
+if (lp && Date.now() - lp.t < 14 * 864e5) { setPuck([lp.lon, lp.lat], null); puckEl.classList.add('stale'); }
+
+// Poloha se čte sama: rychlý odhad ze sítě, pak GPS. Při chybě nižší přesnost a opakování,
+// mezitím aspoň přibližně podle IP. Když je zakázaná, panel řekne přesně, kde ji zapnout.
+const geo = { watch: null, retry: null, low: false, perm: null, got: false, ipTried: false, lastAt: 0, boot: Date.now() };
+const UA = navigator.userAgent;
+const inApp = /FBAN|FBAV|Instagram|Messenger|TikTok|musical_ly|Snapchat|Line\/|; wv\)/.test(UA);
+const isAndroid = /Android/.test(UA), isMac = /Macintosh/.test(UA) && !isIOS;
 
 function startGPS() {
-  if (!('geolocation' in navigator)) { toast({ icon: 'locate', title: 'Tohle zařízení neumí polohu' }); return; }
-  navigator.geolocation.watchPosition(p => {
-    const c = p.coords;
-    st.realFix = { lon: c.longitude, lat: c.latitude, speed: c.speed, heading: c.heading, acc: c.accuracy, t: p.timestamp };
-    if (!st.sim) handleFix({ ...st.realFix });
-  }, err => {
-    if (err.code === 1) toast({ icon: 'locate', title: 'Poloha není povolená', sub: 'Povolte ji v nastavení prohlížeče, jinak navigace nepojede.', ms: 8000, danger: true });
-  }, { enableHighAccuracy: true, maximumAge: 1000, timeout: 30000 });
+  if (!('geolocation' in navigator)) return setGeo('none');
+  if (!isSecureContext) return setGeo('insecure');
+  if (geo.watch != null) navigator.geolocation.clearWatch(geo.watch);
+  geo.watch = navigator.geolocation.watchPosition(onPos, onPosErr, { enableHighAccuracy: !geo.low, maximumAge: 1000, timeout: 20000 });
+  if (!geo.got) navigator.geolocation.getCurrentPosition(onPos, () => { }, { enableHighAccuracy: false, maximumAge: 300000, timeout: 10000 });
+  if (st.geo !== 'ok') setGeo('wait');
+}
+function onPos(p) {
+  if (st.realFix && p.timestamp < st.realFix.t) return; // starší odhad dorazil po čerstvém fixu
+  const c = p.coords;
+  clearTimeout(geo.retry);
+  geo.got = true; geo.lastAt = Date.now();
+  if (geo.low) { geo.low = false; startGPS(); } // první fix je tu, zpátky na plnou přesnost
+  st.realFix = { lon: c.longitude, lat: c.latitude, speed: c.speed, heading: c.heading, acc: c.accuracy, t: p.timestamp };
+  if (st.geo !== 'ok') setGeo('ok');
+  if (!st.sim) handleFix({ ...st.realFix });
+}
+function onPosErr(err) {
+  if (err.code === 1) {
+    if (geo.watch != null) navigator.geolocation.clearWatch(geo.watch);
+    geo.watch = null; setGeo('denied'); approxFromIP(); return;
+  }
+  if (geo.got && Date.now() - geo.lastAt < 60000) return; // krátký výpadek, třeba tunel
+  setGeo(geo.got ? 'lost' : err.code === 3 ? 'slow' : 'unavail');
+  if (!geo.got) approxFromIP();
+  clearTimeout(geo.retry);
+  geo.retry = setTimeout(() => { geo.low = !geo.low; startGPS(); }, geo.low ? 12000 : 1500);
+}
+function setGeo(s) { st.geo = s; renderGeo(); }
+(async () => {
+  try {
+    const s = await navigator.permissions.query({ name: 'geolocation' });
+    geo.perm = s.state;
+    s.onchange = () => { geo.perm = s.state; if (s.state === 'granted') { geo.low = false; startGPS(); } renderGeo(); };
+    renderGeo();
+  } catch { }
+})();
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && (st.geo !== 'ok' || Date.now() - geo.lastAt > 20000)) { geo.low = false; startGPS(); }
+});
+setTimeout(() => renderGeo(), 3200);
+setInterval(() => {
+  puckEl.classList.toggle('stale', !st.sim && (!geo.lastAt || Date.now() - geo.lastAt > 30000));
+  if (geo.got && st.geo === 'ok' && Date.now() - geo.lastAt > 45000 && (st.mode === 'nav' || st.mode === 'drive')) setGeo('lost');
+}, 5000);
+
+async function approxFromIP() {
+  if (st.pos || geo.ipTried) return;
+  geo.ipTried = true;
+  try {
+    const j = await (await fetch('https://get.geojs.io/v1/ip/geo.json')).json();
+    const lon = +j.longitude, lat = +j.latitude;
+    if (!isFinite(lon) || !isFinite(lat) || st.pos) return;
+    const CITY = { Prague: 'Praha', Pilsen: 'Plzeň', 'Ceske Budejovice': 'České Budějovice', 'Usti nad Labem': 'Ústí nad Labem', 'Hradec Kralove': 'Hradec Králové', Pardubice: 'Pardubice', Liberec: 'Liberec', Zlin: 'Zlín', Jihlava: 'Jihlava', 'Karlovy Vary': 'Karlovy Vary', Brno: 'Brno', Ostrava: 'Ostrava', Olomouc: 'Olomouc' };
+    st.approx = { lon, lat, city: j.country_code === 'CZ' ? CITY[j.city] || j.city || '' : '' };
+    if (!lp && st.mode === 'home') map.jumpTo({ center: [lon, lat], zoom: 11.5 });
+    renderGeo();
+  } catch { }
 }
 
-let firstFix = true;
+const GEO_HELP = {
+  denied: () => isIOS ? (standalone()
+    ? 'V iPhonu: Nastavení → Soukromí a zabezpečení → Polohové služby → Weby v Safari → <b>Při používání</b>.'
+    : 'V Safari klepněte na <b>aA</b> vlevo v adresním řádku → Nastavení webu → Poloha → <b>Povolit</b>. Nebo Nastavení → Soukromí → Polohové služby → Weby v Safari.')
+    : isAndroid ? 'Klepněte na ikonu vlevo od adresy → <b>Oprávnění</b> → Poloha → <b>Povolit</b>. A zkontrolujte, že je v telefonu Poloha zapnutá.'
+      : isMac ? 'Klepněte na ikonu vlevo od adresy → Poloha → <b>Povolit</b>. Když ani pak nic: Nastavení systému → Soukromí a zabezpečení → <b>Polohové služby</b> → povolit prohlížeč.'
+        : 'Klepněte na ikonu zámku vlevo od adresy → Poloha → <b>Povolit</b>.',
+  off: () => isIOS ? 'Zapněte <b>Polohové služby</b>: Nastavení → Soukromí a zabezpečení → Polohové služby.'
+    : isAndroid ? 'Zapněte <b>Polohu</b> v horní liště telefonu (stáhněte ji prstem dolů).'
+      : isMac ? 'Nastavení systému → Soukromí a zabezpečení → <b>Polohové služby</b> → zapnout a povolit prohlížeč.'
+        : 'Zapněte polohu v nastavení systému a povolte ji prohlížeči.',
+};
+function geoCardHTML() {
+  const s = st.geo;
+  if (s === 'ok' || s === 'lost') return '';
+  const early = Date.now() - geo.boot < 3000;
+  if (s === 'wait' && early && geo.perm !== 'prompt') return '';
+  const approx = st.approx ? `<span class="geo__approx">Zatím ukazuju přibližně podle sítě${st.approx.city ? ': ' + esc(st.approx.city) : ''}.</span>` : '';
+  const app = inApp ? `<p>Vestavěný prohlížeč polohu často blokuje. Otevřete odkaz v <b>${isIOS ? 'Safari' : 'Chrome'}</b> (menu ⋯ → Otevřít v prohlížeči).</p>` : '';
+  let ic = 'locate', t, p, btn = 'Zkusit znovu', cls = '';
+  if (s === 'wait') { t = geo.perm === 'prompt' ? 'Povolte prosím polohu' : 'Hledám, kde jste…'; p = geo.perm === 'prompt' ? 'Prohlížeč se ptá, jestli smí navigace znát polohu. Bez ní nepojede.' : 'Venku pod širým nebem to jde rychleji.'; btn = geo.perm === 'prompt' ? 'Povolit polohu' : ''; cls = 'wait'; }
+  else if (s === 'denied') { t = 'Poloha je zakázaná'; p = GEO_HELP.denied(); cls = 'bad'; }
+  else if (s === 'unavail' || s === 'slow') { t = 'Telefon zatím neví, kde je'; p = GEO_HELP.off(); }
+  else { t = 'Tady poloha nejde'; p = s === 'insecure' ? 'Aplikace musí běžet přes https.' : 'Tenhle prohlížeč polohu nepodporuje. Zkuste Safari nebo Chrome.'; btn = ''; cls = 'bad'; }
+  return `<div class="geo ${cls}"><span class="geo__ic">${s === 'wait' ? '<span class="spinner"></span>' : icon(ic)}</span><div class="geo__t"><b>${t}</b><p>${p}</p>${app}${approx}</div>${btn ? `<button class="btn sm" data-act="geo">${btn}</button>` : ''}</div>`;
+}
+function renderGeo() {
+  const el = document.getElementById('geoCard');
+  if (el) { const h = geoCardHTML(); if (el.dataset.h !== h) { el.dataset.h = h; el.innerHTML = h; } }
+  renderStatus();
+}
+
+let firstFix = true, lpSaved = 0;
 function handleFix(fix) {
   const prev = st.lastFix, here = [fix.lon, fix.lat];
   const moved = prev ? dist([prev.lon, prev.lat], here) : 0, dt = prev ? (fix.t - prev.t) / 1000 : 0;
   if (fix.speed == null || isNaN(fix.speed)) fix.speed = dt > 0 && moved > (fix.acc || 10) * 0.5 ? Math.min(70, moved / dt) : 0;
   if (fix.heading == null || isNaN(fix.heading)) fix.heading = moved > 4 ? bearing([prev.lon, prev.lat], here) : st.heading;
   st.lastFix = fix; st.pos = here; st.speed = fix.speed * 3.6; if (fix.heading != null) st.heading = fix.heading;
+  st.approx = null;
   if (rec.active) rec.add(fix);
+  if (!fix.sim && Date.now() - lpSaved > 15000) { lpSaved = Date.now(); lastPos.set({ lon: fix.lon, lat: fix.lat, t: Date.now() }); }
   if (firstFix) {
     firstFix = false; setFollow(true);
-    if (st.mode === 'home') map.jumpTo({ center: here, zoom: 14.5, padding: homePad() });
+    if (st.mode === 'home') {
+      const far = dist(map.getCenter().toArray(), here) > 30000;
+      far ? map.jumpTo({ center: here, zoom: 14.5, padding: homePad() }) : map.easeTo({ center: here, zoom: Math.max(14.5, map.getZoom()), padding: homePad(), duration: 700 });
+    }
     ensureTraffic([here]).catch(() => { });
     if (st.mode === 'home') renderHome();
   }
   if (st.nav) { st.nav.feed(fix); return; }
   setPuck(here, st.heading);
+  drawAcc(fix);
   refreshLimit(fix);
   updateSpeedo(st.speed, st.limit, st.limitKnown);
-  if (st.follow && st.mode === 'home') map.easeTo({ center: here, duration: 900, easing: t => t, padding: homePad(), ...(st.speed > 15 ? { bearing: st.heading || 0 } : {}) });
+  driveTick(fix);
+  if (st.follow && st.mode === 'drive') {
+    const v = st.speed, z = v < 40 ? 16.6 : v < 70 ? 16 : v < 100 ? 15.4 : 14.8;
+    map.easeTo({ center: here, bearing: st.heading ?? map.getBearing(), pitch: 50, zoom: z, duration: 950, easing: t => t, padding: drivePad() });
+  } else if (st.follow && st.mode === 'home') map.easeTo({ center: here, duration: 900, easing: t => t, padding: homePad(), ...(st.speed > 15 ? { bearing: st.heading || 0 } : {}) });
   if ($('hud') && !$('hud').hidden) updateHud();
 }
+function drivePad() {
+  if (innerWidth >= 720) return { top: Math.round(innerHeight * 0.4), bottom: 0, left: 0, right: sheetEl.offsetWidth + 16 };
+  return { top: Math.round(innerHeight * 0.4), bottom: sheetEl.offsetHeight, left: 0, right: 0 };
+}
+// kruh přesnosti, jen když poloha není přesná
+function drawAcc(fix) {
+  const show = fix.acc > 30 && fix.acc < 5000 && st.mode !== 'nav';
+  if (show) {
+    const ring = [];
+    for (let i = 0; i <= 48; i++) ring.push(dest([fix.lon, fix.lat], i * 7.5, fix.acc));
+    setData('acc', fc([{ type: 'Feature', geometry: { type: 'Polygon', coordinates: [ring] }, properties: {} }]));
+  } else if (srcData.acc && srcData.acc.features.length) setData('acc', fc([]));
+}
 
-// limit při volné jízdě (bez trasy)
+// limit a název silnice při jízdě bez trasy
 const limQ = { t: 0, p: null, busy: false };
 async function refreshLimit(fix) {
   if (limQ.busy || fix.speed < 2.5) return;
   const p = [fix.lon, fix.lat];
   if (Date.now() - limQ.t < 5000 || (limQ.p && dist(limQ.p, p) < 120)) return;
   limQ.busy = true; limQ.t = Date.now(); limQ.p = p;
-  try { const r = await locateLimit(p, fix.heading); if (r) { st.limit = r.limit; st.limitKnown = r.known; } } catch { } finally { limQ.busy = false; }
+  try {
+    const r = await locateLimit(p, fix.heading);
+    if (r) { st.limit = r.limit; st.limitKnown = r.known; st.road = r.name; const el = $('driveRoad'); if (el && r.name) el.textContent = r.name; }
+  } catch { } finally { limQ.busy = false; }
 }
 
 function updateSpeedo(kmh, limit, known = true) {
-  const show = st.mode === 'nav' || kmh > 4;
+  const show = st.mode === 'nav' || st.mode === 'drive' || kmh > 4;
   $('speedo').hidden = !show;
   if (!show) return;
   $('speedVal').textContent = Math.round(kmh);
@@ -277,31 +415,178 @@ function updateSpeedo(kmh, limit, known = true) {
   $('speedo').classList.toggle('over', !!limit && kmh > limit + (S.overTol || 0));
 }
 
+// ---------- jízda bez cíle ----------
+// Rozjedete se bez trasy → aplikace sama přepne do jízdního pohledu a hlídá, co je před vámi.
+let fastFixes = 0, overN = 0, overSaid = 0;
+const said = new Map();
+function driveTick(fix) {
+  if (st.mode !== 'drive') {
+    const can = st.mode === 'home' && $('page').hidden && !fix.sim && Date.now() - (st.driveOff || 0) > 600000;
+    fastFixes = can && st.speed >= 20 ? fastFixes + 1 : 0;
+    if (fastFixes >= 3) enterDrive();
+    return;
+  }
+  const d = st.drive;
+  if (d.prev) d.km += dist(d.prev, st.pos) / 1000;
+  d.prev = st.pos; d.max = Math.max(d.max, st.speed);
+  if (st.speed < 5) { d.slow = d.slow || Date.now(); if (Date.now() - d.slow > 120000) { exitDrive(); return; } } else d.slow = 0;
+  if (S.driveAlerts) driveAlerts(fix);
+  if (S.warnOver && st.limitKnown && st.limit) {
+    overN = st.speed > st.limit + (S.overTol || 0) + 2 ? overN + 1 : 0;
+    if (overN >= 3 && Date.now() - overSaid > 60000) { overSaid = Date.now(); onOver(); }
+  }
+  const s = $('driveStats'); if (s) s.innerHTML = driveStats();
+}
+function driveAlerts(fix) {
+  const list = lookAhead(st.pos, st.heading, fix.speed || 0, reports, { cams: S.warnCams, bumps: S.warnBumps, traffic: S.warnTraffic });
+  const now = Date.now();
+  for (const h of list) {
+    if (said.has(h.key) && now - said.get(h.key) < 600000) continue;
+    said.set(h.key, now);
+    if (S.voiceAlerts) voice.say(voice.phraseAlert(h.kind, h.d, { ms: h.ms, text: h.rep && h.rep.label }), { priority: 1 });
+    if (['cam', 'police', 'accident', 'closure'].includes(h.kind) || (h.rep && h.rep.type === 'mcam')) navigator.vibrate && navigator.vibrate(40);
+  }
+  showHazard(list[0]);
+}
+function enterDrive() {
+  st.mode = 'drive'; st.drive = { t0: Date.now(), km: 0, max: 0, slow: 0, prev: st.pos };
+  fastFixes = 0; overN = 0;
+  setBody(); setFollow(true); wake(true);
+  if (S.record && !rec.active) startRec(true);
+  renderDrive();
+  toast({ icon: 'speed', title: 'Jízda bez cíle', sub: 'Hlídám radary, policii a kolony před vámi.', ms: 3500 });
+}
+function exitDrive(manual = false) {
+  if (manual) st.driveOff = Date.now();
+  st.drive = null; showHazard(null); clearAsk(); wake(false);
+  if (rec.active && rec.auto) stopRec();
+  renderHome(); setFollow(true);
+  map.easeTo({ pitch: 0, bearing: 0, zoom: 15, padding: homePad(), duration: 700, ...(st.pos ? { center: st.pos } : {}) });
+}
+function driveStats() {
+  const d = st.drive; if (!d) return '';
+  return `<div class="stat"><b>${shortTime((Date.now() - d.t0) / 1000)}</b><span>na cestě</span></div><div class="stat"><b>${d.km < 10 ? d.km.toFixed(1).replace('.', ',') : Math.round(d.km)} km</b><span>ujeto</span></div><div class="stat"><b>${Math.round(d.max)}</b><span>max km/h</span></div>`;
+}
+function renderDrive() {
+  sheet(`
+    <div class="drivebar peek">
+      <div class="drivebar__road"><span class="label">Jízda bez cíle</span><b id="driveRoad">${esc(st.road || 'Jedeme')}</b></div>
+      <button class="round flat" data-act="search" aria-label="Kam jedeme">${icon('search')}</button>
+      <button class="round flat" data-act="report" aria-label="Nahlásit">${icon('flagplus')}</button>
+      <button class="round flat" data-act="driveend" aria-label="Ukončit">${icon('close')}</button>
+    </div>
+    <div class="stat-grid three" id="driveStats">${driveStats()}</div>
+    <div class="nav-actions">
+      <button class="${rec.active ? 'on' : ''}" data-act="rec">${icon('trips')}${rec.active ? 'Nahrávám' : 'Nahrávat'}</button>
+      <button data-act="near" data-k="fuel">${icon('fuel')}Pumpa</button>
+      <button data-act="near" data-k="food">${icon('food')}Jídlo</button>
+      <button data-act="mute">${icon(S.muted ? 'mute' : 'volume')}Hlas</button>
+      <button data-act="hud">${icon('hud')}HUD</button>
+    </div>`, 'drive', true);
+}
+
+// ---------- co je před námi (karta nad rychloměrem) ----------
+const HZ = { cam: ['cam', 'Radar'], secStart: ['speed', 'Úsekové měření'], secIn: ['speed', 'V úsekovém měření'], bump: ['bump', 'Zpomalovací práh'] };
+function hazardInfo(h) {
+  if (h.rep) {
+    const R = reportType(h.rep.type) || REPORT_TYPES[0];
+    return { ic: R.icon, title: R.label, sub: `${h.rep.mine ? 'vaše hlášení' : 'od řidičů'} · ${ago(h.rep.t)}${h.rep.up > 1 ? ` · ${h.rep.up}× potvrzeno` : ''}`, danger: ['police', 'mcam', 'accident'].includes(h.rep.type) };
+  }
+  if (h.ev) return { ic: KIND_ICON[h.ev.kind] || 'hazard', title: evName(h.ev), sub: [h.ev.road, h.ev.loc].filter(Boolean).join(' · '), danger: h.ev.kind !== 'jam' };
+  const [ic, title] = HZ[h.kind] || ['hazard', 'Pozor'];
+  return { ic, title, sub: h.kind === 'secIn' ? 'držte průměr pod limitem' : h.kind === 'cam' ? 'pevný radar' : h.kind === 'secStart' ? 'měří se průměrná rychlost' : '', danger: h.kind === 'cam' || h.kind === 'secStart', ms: h.ms };
+}
+let askT = null;
+function showHazard(h) {
+  const el = $('hazard'), prev = st.hazard;
+  if (!h) {
+    st.hazard = null;
+    if (prev && prev.rep && prev.d < 250 && canVote(prev.rep.id)) askVote(prev.rep);
+    else if (!st.ask) el.hidden = true;
+    return;
+  }
+  if (st.ask) clearAsk();
+  if (!prev || prev.key !== h.key) {
+    const I = hazardInfo(h);
+    el.className = 'hazard' + (I.danger ? ' danger' : '');
+    el.innerHTML = `<span class="hz__ic">${icon(I.ic)}</span><div class="hz__t"><b>${esc(I.title)}</b>${I.sub ? `<span>${esc(I.sub)}</span>` : ''}</div>${I.ms ? `<span class="limit sm">${I.ms}</span>` : ''}<b class="hz__d" id="hzD"></b><i class="hz__bar"><i id="hzBar"></i></i>`;
+    st.hazard = { key: h.key, d0: Math.max(h.d, 150), rep: h.rep };
+  }
+  st.hazard.d = h.d;
+  el.hidden = false;
+  $('hzD').textContent = h.kind === 'secIn' ? 'ještě ' + fmtDist(h.d) : fmtDist(h.d);
+  $('hzBar').style.transform = `scaleX(${Math.max(0.02, Math.min(1, 1 - h.d / st.hazard.d0))})`;
+}
+function askVote(rep) {
+  const R = reportType(rep.type) || REPORT_TYPES[0], el = $('hazard');
+  st.ask = rep;
+  el.className = 'hazard ask'; el.hidden = false;
+  el.innerHTML = `<span class="hz__ic">${icon(R.icon)}</span><div class="hz__t"><b>${R.label} pořád tam?</b><span>Pomůžete ostatním</span></div><button class="hz__btn" data-act="vote" data-id="${esc(rep.id)}" data-v="1">Ano</button><button class="hz__btn no" data-act="vote" data-id="${esc(rep.id)}" data-v="-1">Ne</button>`;
+  clearTimeout(askT); askT = setTimeout(clearAsk, 14000);
+}
+function clearAsk() { st.ask = null; clearTimeout(askT); if (!st.hazard) $('hazard').hidden = true; }
+
+// ---------- stavový řádek nahoře (nahrávání, signál) ----------
+let recTimer = null;
+function renderStatus() {
+  const el = $('status'), items = [];
+  if (rec.active) { const s = Math.round((Date.now() - rec.trip.start) / 1000); items.push(`<button class="pill rec" data-act="recstop" aria-label="Zastavit nahrávání"><i></i>${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}</button>`); }
+  if (st.geo === 'lost' && (st.mode === 'nav' || st.mode === 'drive')) items.push(`<span class="pill warn">${icon('locate')}Slabý signál GPS</span>`);
+  const h = items.join('');
+  if (el.dataset.h !== h) { el.dataset.h = h; el.innerHTML = h; }
+  el.hidden = !items.length;
+}
+
 // ---------- panel ----------
 const sheetEl = $('sheet'), sheetBody = $('sheetBody');
-function sheet(html, mode = st.mode) {
+// collapsed: při přepnutí do jiného režimu panel sbalit/rozbalit, při překreslení stejného nechat, jak ho má uživatel
+function sheet(html, mode = st.mode, collapsed = false) {
+  if (sheetEl.dataset.mode !== mode) sheetEl.classList.toggle('collapsed', collapsed);
   sheetEl.dataset.mode = mode;
-  sheetEl.classList.remove('collapsed');
   sheetBody.innerHTML = html;
   hydrateIcons(sheetBody);
 }
 new ResizeObserver(() => document.documentElement.style.setProperty('--sheet-h', sheetEl.offsetHeight + 8 + 'px')).observe(sheetEl);
 new ResizeObserver(() => document.documentElement.style.setProperty('--man-h', $('maneuver').offsetHeight + 'px')).observe($('maneuver'));
-$('sheetGrip').onclick = () => sheetEl.classList.toggle('collapsed');
+const toggleSheet = open => { sheetEl.classList.toggle('collapsed', open === undefined ? undefined : !open); sheetBody.scrollTop = 0; };
+// tažení panelu prstem za úchyt nebo horní část
 {
-  let y0 = null;
-  $('sheetGrip').addEventListener('pointerdown', e => { y0 = e.clientY; });
-  addEventListener('pointerup', e => {
-    if (y0 == null) return;
-    const dy = e.clientY - y0; y0 = null;
-    if (dy > 40) sheetEl.classList.add('collapsed'); else if (dy < -40) sheetEl.classList.remove('collapsed');
+  let y0 = null, dy = 0, drag = false;
+  sheetEl.addEventListener('pointerdown', e => {
+    if (e.button > 0 || !e.target.closest('.sheet__grip, .peek') || e.target.closest('input, .shortcuts')) return;
+    if (!sheetEl.classList.contains('collapsed') && sheetBody.scrollTop > 4 && !e.target.closest('.sheet__grip')) return;
+    y0 = e.clientY; dy = 0; drag = false;
   });
+  addEventListener('pointermove', e => {
+    if (y0 == null) return;
+    dy = e.clientY - y0;
+    if (!drag && Math.abs(dy) > 8) { drag = true; sheetEl.classList.add('dragging'); }
+    if (drag) {
+      const col = sheetEl.classList.contains('collapsed');
+      const t = col ? (dy < 0 ? dy * 0.35 : dy * 0.15) : (dy > 0 ? dy : dy * 0.15);
+      sheetEl.style.transform = `translateY(${t}px)`;
+    }
+  });
+  const end = () => {
+    if (y0 == null) return;
+    y0 = null; sheetEl.classList.remove('dragging'); sheetEl.style.transform = '';
+    if (!drag) return;
+    // tažení nesmí zároveň kliknout na tlačítko pod prstem
+    addEventListener('click', ev => { ev.stopPropagation(); ev.preventDefault(); }, { capture: true, once: true });
+    setTimeout(() => { drag = false; }, 0);
+    if (dy > 40) toggleSheet(false); else if (dy < -40) toggleSheet(true);
+  };
+  addEventListener('pointerup', end); addEventListener('pointercancel', end);
 }
+$('sheetGrip').onclick = () => toggleSheet();
 
 function setBody() {
-  document.body.classList.toggle('nav', st.mode === 'nav');
+  for (const m of ['nav', 'drive', 'plan', 'joy', 'home']) document.body.classList.toggle(m, st.mode === m);
   $('maneuver').hidden = st.mode !== 'nav';
   if (st.mode !== 'nav') $('pace').hidden = true;
+  if (st.mode !== 'nav' && st.mode !== 'drive') { showHazard(null); clearAsk(); }
+  if (map) applyVisibility();
+  renderStatus();
 }
 
 let toastT = null;
@@ -313,46 +598,108 @@ function toast({ icon: ic = 'info', title, sub = '', danger = false, ms = 4200 }
 }
 $('toast').onclick = () => { $('toast').hidden = true; };
 
+// malé okno zespodu nad mapou (hlášení, detail hlášení)
+function modal(html) {
+  $('modalCard').innerHTML = `<i class="modal__grip"></i>${html}`;
+  hydrateIcons($('modalCard'));
+  $('modal').hidden = false;
+}
+function closeModal() { $('modal').hidden = true; $('modalCard').innerHTML = ''; }
+$('modal').addEventListener('click', e => { if (e.target.id === 'modal' || e.target.classList.contains('modal__scrim')) closeModal(); });
+
 // ---------- domovská obrazovka ----------
 function greeting() {
   const h = new Date().getHours();
   return h < 5 ? 'Dobrou <em>noc</em>' : h < 10 ? 'Dobré <em>ráno</em>' : h < 18 ? 'Dobrý <em>den</em>' : 'Dobrý <em>večer</em>';
 }
 function trafficMeta() {
-  const n = traffic.events.filter(e => e.kind !== 'info').length;
+  const n = traffic.events.filter(e => e.kind !== 'info').length, r = reports.length;
+  const rp = r ? ` · ${r} ${pl(r, 'hlášení', 'hlášení', 'hlášení')} od řidičů` : '';
   if (traffic.loading && !n) return 'načítám dopravu…';
-  if (n) return `${n} ${pl(n, 'událost', 'události', 'událostí')} v dopravě`;
-  return traffic.error ? 'doprava nedostupná' : st.pos ? 'na silnicích klid' : 'čekám na polohu…';
+  if (n) return `${n} ${pl(n, 'událost', 'události', 'událostí')} v dopravě${rp}`;
+  return (traffic.error ? 'doprava nedostupná' : 'na silnicích klid') + rp;
 }
 let installEvt = null;
 addEventListener('beforeinstallprompt', e => { e.preventDefault(); installEvt = e; if (st.mode === 'home') renderHome(); });
 function installHint() {
   if (standalone()) return '';
-  if (installEvt) return `<div class="install"><b>Nainstalujte si Navigaci.</b> Poběží přes celou obrazovku jako běžná aplikace.<div style="margin-top:10px"><button class="btn" data-act="install" style="height:42px">${icon('download')} Nainstalovat</button></div></div>`;
-  if (isIOS) return `<div class="install"><b>Do iPhonu jako aplikace:</b> v Safari klepněte na ${icon('share', 'inline')} <b>Sdílet</b> a pak <b>Přidat na plochu</b>.</div>`;
+  if (installEvt) return `<div class="install">${icon('download')}<div><b>Nainstalujte si Navigaci</b><span>Poběží přes celou obrazovku jako běžná aplikace.</span></div><button class="btn sm" data-act="install">Instalovat</button></div>`;
+  if (isIOS) return `<div class="install">${icon('share')}<div><b>Do iPhonu jako aplikace</b><span>V Safari klepněte na Sdílet a pak Přidat na plochu.</span></div></div>`;
   return '';
 }
 function placeShort(p) { return p ? p.name : 'Nastavit'; }
+function placeSub(p) { return p ? (st.pos ? fmtDist(dist(st.pos, [p.lon, p.lat])) : esc(p.name)) : 'nastavit'; }
 function renderHome() {
   st.mode = 'home'; setBody();
   const pk = parking.get();
+  const sc = (act, ic, t, sub = '', extra = '', cls = '') => `<button class="sc ${cls}" data-act="${act}" ${extra}><span class="sc__ic">${icon(ic)}</span><b>${t}</b>${sub ? `<small>${sub}</small>` : ''}</button>`;
   sheet(`
-    <div class="peek hello"><h1>${greeting()}</h1><span class="meta">${trafficMeta()}</span></div>
-    ${installHint()}
-    <div class="tiles">
-      <button class="tile hero" data-act="joy">${icon('joy')}<div><b>Joy ride</b><span>Projížďka na čas. Okresky, zatáčky a rally hlášení.</span></div></button>
-      <button class="tile" data-act="place" data-k="home">${icon('home')}<div><b>Domů</b><span>${esc(placeShort(places.home))}</span></div></button>
-      <button class="tile" data-act="place" data-k="work">${icon('work')}<div><b>Práce</b><span>${esc(placeShort(places.work))}</span></div></button>
+    <div class="peek home-top">
+      <div class="hello"><h1>${greeting()}</h1><span class="meta" id="homeMeta">${trafficMeta()}</span></div>
+      <div class="searchrow">
+        <button class="search-pill" data-act="search">${icon('search')}<span class="search-pill__text">Kam jedeme?</span></button>
+        <button class="round flat" data-act="settings" aria-label="Nastavení">${icon('sliders')}</button>
+      </div>
+      <div id="geoCard">${geoCardHTML()}</div>
+      <div class="shortcuts">
+        ${sc('joy', 'joy', 'Joy ride', 'projížďka', '', 'hero')}
+        ${sc('place', 'home', 'Domů', placeSub(places.home), 'data-k="home"')}
+        ${sc('place', 'work', 'Práce', placeSub(places.work), 'data-k="work"')}
+        ${sc('near', 'fuel', 'Pumpa', 'v okolí', 'data-k="fuel"')}
+        ${sc('near', 'food', 'Jídlo', 'v okolí', 'data-k="food"')}
+        ${sc('near', 'parking', 'Parkování', 'v okolí', 'data-k="parking"')}
+        ${sc('near', 'coffee', 'Kafe', 'v okolí', 'data-k="coffee"')}
+        ${sc('rec', 'trips', rec.active ? 'Nahrávám' : 'Nahrát', rec.active ? 'zastavit' : 'jízdu', '', rec.active ? 'on' : '')}
+      </div>
     </div>
-    ${recents.length ? `<div class="section-h"><span class="label">Nedávné</span></div><div class="list">${recents.slice(0, 3).map((r, i) => placeRow(r, 'recent', i, 'clock')).join('')}</div>` : ''}
+    ${installHint()}
+    ${recents.length ? `<div class="section-h"><span class="label">Nedávné</span></div><div class="list">${recents.slice(0, 4).map((r, i) => placeRow(r, 'recent', i, 'clock')).join('')}</div>` : ''}
+    ${places.fav.length ? `<div class="section-h"><span class="label">Oblíbené</span></div><div class="list">${places.fav.slice(0, 5).map((r, i) => placeRow(r, 'fav', i, 'star')).join('')}</div>` : ''}
     <div class="section-h"><span class="label">Další</span></div>
     <div class="list">
       <button class="row" data-act="trips">${icon('trips')}<div class="row__t"><b>Moje jízdy</b><span>Nahrané trasy, rychlosti, export GPX</span></div>${icon('chevron')}</button>
       ${pk ? `<button class="row" data-act="parkshow">${icon('parking')}<div class="row__t"><b>Zaparkované auto</b><span>${ago(pk.t)}${st.pos ? ' · ' + fmtDist(dist(st.pos, [pk.lon, pk.lat])) : ''}</span></div>${icon('chevron')}</button>` : ''}
-    </div>`, 'home');
+      <button class="row" data-act="layers">${icon('layers')}<div class="row__t"><b>Mapa a vzhled</b><span>${THEMES[S.theme].name} · doprava, radary, prahy</span></div>${icon('chevron')}</button>
+    </div>
+    <p class="note-text">Tip: když se rozjedete bez cíle, navigace sama přepne do jízdy a hlídá radary, policii a kolony před vámi.</p>`, 'home', true);
 }
 function placeRow(p, act, i, ic = 'pin') {
-  return `<button class="row" data-act="${act}" data-i="${i}">${icon(ic)}<div class="row__t"><b>${esc(p.name)}</b><span>${esc(p.sub || '')}</span></div><span class="row__end">${st.pos ? fmtDist(dist(st.pos, [p.lon, p.lat])) : ''}</span></button>`;
+  return `<button class="row" data-act="${act}" data-i="${i}">${icon(ic)}<div class="row__t"><b>${esc(p.name)}</b><span>${esc(p.sub || '')}</span></div><span class="row__end">${p.d != null ? fmtDist(p.d) : st.pos ? fmtDist(dist(st.pos, [p.lon, p.lat])) : ''}</span></button>`;
+}
+
+// ---------- v okolí ----------
+const NEAR = { fuel: ['Pumpy v okolí', '[fuel]', 'fuel', 'Čerpací stanice'], food: ['Kde se najíst', 'restaurace', 'food', 'Restaurace'], parking: ['Parkování', '[parking]', 'parking', 'Parkoviště'], coffee: ['Kavárny', 'kavárna', 'coffee', 'Kavárna'] };
+let nearList = [];
+async function nomBox(q, box, limit = 40) {
+  const r = await fetch(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=jsonv2&limit=${limit}&viewbox=${box.join(',')}&bounded=1&addressdetails=1&accept-language=cs&countrycodes=cz`);
+  if (!r.ok) throw new Error('nominatim ' + r.status);
+  return (await r.json()).map(x => {
+    const a = x.address || {}, city = a.city || a.town || a.village || a.municipality || '';
+    const street = a.road ? `${a.road}${a.house_number ? ' ' + a.house_number : ''}` : '';
+    return { name: x.name || '', sub: [street, city].filter(Boolean).join(', '), lon: +x.lon, lat: +x.lat };
+  });
+}
+async function openNearby(k) {
+  const [title, q, ic, generic] = NEAR[k];
+  const c = st.pos || (st.approx && [st.approx.lon, st.approx.lat]) || map.getCenter().toArray();
+  page(title, `<div class="progress"><span class="spinner"></span>Hledám nejbližší…</div>`);
+  pageRender = null;
+  try {
+    let list = [];
+    for (const r of [0.03, 0.09, 0.25]) {
+      list = await nomBox(q, [c[0] - r * 1.5, c[1] + r, c[0] + r * 1.5, c[1] - r]);
+      if (list.length >= 4) break;
+      await sleep(1000);
+    }
+    if ($('page').hidden || $('pageTitle').textContent !== title) return;
+    nearList = list.map(p => ({ ...p, name: p.name || generic, d: dist(c, [p.lon, p.lat]) })).sort((a, b) => a.d - b.d).slice(0, 25);
+    $('pageBody').innerHTML = nearList.length
+      ? `<p class="note-text" style="margin-top:0">${st.pos ? 'Seřazeno podle vzdálenosti vzdušnou čarou.' : 'Poloha zatím není známá, hledám kolem středu mapy.'}</p><div class="list">${nearList.map((p, i) => placeRow(p, 'nearpick', i, ic)).join('')}</div>`
+      : `<div class="empty"><b>Nic poblíž</b>V okolí jsme nic nenašli. Zkuste hledání podle názvu.</div>`;
+    hydrateIcons($('pageBody'));
+  } catch {
+    $('pageBody').innerHTML = `<div class="empty"><b>Hledání nejde</b>Zkontrolujte připojení k internetu.</div>`;
+  }
 }
 
 // ---------- celoobrazovkové stránky ----------
@@ -680,6 +1027,7 @@ function startNav(route, { sim = false, joy = false } = {}) {
     prefs, rally: () => st.rally,
   });
   st.nav.start(route, st.stops, reports);
+  st.drive = null; showHazard(null);
   wake(true);
   if (S.record && !rec.active && !sim) startRec(true);
   setFollow(true);
@@ -692,13 +1040,13 @@ function startNav(route, { sim = false, joy = false } = {}) {
   else if (st.lastFix) handleFix({ ...st.lastFix, t: Date.now() });
 }
 
-let lastTrim = 0, lastUp = '';
+let lastTrim = 0;
 function onNavUpdate(s) {
   st.navState = s;
   setPuck(s.pos, s.bearing);
   if (st.follow) {
     const v = s.speed, z = (v < 30 ? 17 : v < 60 ? 16.4 : v < 95 ? 15.8 : 15.1) + (st.rally ? 0.3 : 0);
-    map.easeTo({ center: s.pos, bearing: s.bearing, pitch: 58, zoom: z, duration: 950, easing: t => t, padding: { top: Math.round(innerHeight * 0.42), bottom: innerWidth >= 720 ? 0 : sheetEl.offsetHeight, left: 0, right: innerWidth >= 720 ? sheetEl.offsetWidth : 0 } });
+    map.easeTo({ center: s.pos, bearing: s.bearing, pitch: 58, zoom: z, duration: 950, easing: t => t, padding: { top: Math.round(innerHeight * 0.44), bottom: innerWidth >= 720 ? 0 : sheetEl.offsetHeight, left: 0, right: innerWidth >= 720 ? sheetEl.offsetWidth : 0 } });
   }
   const m = s.next;
   $('manArrow').innerHTML = maneuverSVG(m ? m.type : 4, m && m.exit);
@@ -709,10 +1057,9 @@ function onNavUpdate(s) {
   else nx.hidden = true;
   updateSpeedo(s.speed, s.limit, true);
   renderPace(s.notes);
-  const eta = $('navEta'), rem = $('navRem');
-  if (eta) { eta.textContent = clock(s.eta); rem.textContent = `${fmtTime(s.remT)} · ${fmtDist(s.remaining)}`; }
-  const up = upcomingHTML(s);
-  if (up !== lastUp && $('navUp')) { lastUp = up; $('navUp').innerHTML = up; }
+  const t = $('navRemT');
+  if (t) { t.textContent = fmtTime(s.remT); $('navRem').textContent = `příjezd ${clock(s.eta)} · ${fmtDist(s.remaining)}`; }
+  if (!st.arrived) showHazard(navHazard(s));
   if (Date.now() - lastTrim > 2000) {
     lastTrim = Date.now();
     const r = st.navRoute, i = st.nav.idx;
@@ -726,16 +1073,18 @@ function onNavUpdate(s) {
   }
   if (!$('hud').hidden) updateHud();
 }
-function upcomingHTML(s) {
-  const out = [];
-  for (const u of s.upcoming) {
-    if (u.kind === 'cam') out.push(`<span>${icon('cam')}radar${u.ms ? ' ' + u.ms : ''} · ${fmtDist(u.d)}</span>`);
-    else if (u.inside) out.push(`<span>${icon('speed')}úsekové ${u.ms || ''} · ještě ${fmtDist(u.left)}</span>`);
-    else out.push(`<span>${icon('speed')}úsekové ${u.ms || ''} · ${fmtDist(u.d)}</span>`);
+// nejbližší věc na trase před námi: radar, úsekovka, hlášení řidičů, nehoda/kolona/uzavírka
+function navHazard(s) {
+  const inSec = s.upcoming.find(u => u.inside);
+  if (inSec) return { key: 'in' + inSec.ms + '@' + Math.round(inSec.left + s.s), kind: 'secIn', d: inSec.left, ms: inSec.ms };
+  const v = s.speed / 3.6, out = [];
+  for (const u of s.upcoming) if (u.d < Math.max(450, v * 18)) out.push({ key: u.kind + Math.round(s.s + u.d), kind: u.kind === 'cam' ? 'cam' : 'secStart', d: u.d, ms: u.ms });
+  for (const { s: rs, rep } of st.nav.reports || []) { const d = rs - s.s; if (d > 0 && d < Math.max(900, v * 40)) out.push({ key: rep.id, kind: rep.type === 'police' ? 'police' : 'report', d, rep }); }
+  for (const e of st.navRoute.a.events) {
+    const d = e.s - s.s;
+    if (d > 0 && d < Math.max(1500, v * 60) && (['accident', 'jam'].includes(e.ev.kind) || (e.ev.kind === 'closure' && e.ev.full))) out.push({ key: e.ev.id, kind: e.ev.kind, d, ev: e.ev });
   }
-  const ev = st.navRoute.a.events.find(e => e.s > s.s && e.ev.kind !== 'info');
-  if (ev && ev.s - s.s < 30000) out.push(`<span>${icon(KIND_ICON[ev.ev.kind] || 'info')}${esc(evName(ev.ev))} · ${fmtDist(ev.s - s.s)}</span>`);
-  return out.join('');
+  return out.sort((a, b) => a.d - b.d)[0] || null;
 }
 const curveSVG = dir => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"><path d="${dir === 'P' ? 'M6 21v-8a7 7 0 017-7h5M15 3l3 3-3 3' : 'M18 21v-8a7 7 0 00-7-7H6M9 3L6 6l3 3'}"/></svg>`;
 function renderPace(notes) {
@@ -745,29 +1094,31 @@ function renderPace(notes) {
   el.innerHTML = notes.slice(0, 3).map((n, i) => `<div class="note ${i === 0 ? 'first' : ''}">${curveSVG(n.dir)}${esc(n.short.slice(1))}${i === 0 ? `<small>${Math.max(0, Math.round(n.d / 10) * 10)} m</small>` : n.gap === 'do' ? '<small>do</small>' : ''}</div>`).join('');
 }
 function renderNav() {
+  const s = st.navState, a = st.navRoute.a;
+  const act = (k, ic, t, on = false, extra = '') => `<button class="${on ? 'on' : ''}" data-act="${k}" ${extra}>${icon(ic)}${t}</button>`;
   sheet(`
     <div class="navbar peek">
-      <button class="round flat end" data-act="end" aria-label="Ukončit">${icon('close')}</button>
-      <div class="navbar__eta"><b id="navEta">${st.navState ? clock(st.navState.eta) : clock(Date.now() + st.navRoute.a.time * 1000)}</b><span id="navRem">${st.navState ? '' : fmtTime(st.navRoute.a.time) + ' · ' + fmtDist(st.navRoute.length)}</span></div>
-      <button class="round flat" data-act="mute" aria-label="Hlas">${icon(S.muted ? 'mute' : 'volume')}</button>
+      <button class="round end" data-act="end" aria-label="Ukončit navigaci">${icon('close')}</button>
+      <button class="navbar__eta" data-act="expand"><b id="navRemT">${fmtTime(s ? s.remT : a.time)}</b><span id="navRem">příjezd ${clock(s ? s.eta : Date.now() + a.time * 1000)} · ${fmtDist(s ? s.remaining : st.navRoute.length)}</span></button>
+      <button class="round flat" data-act="report" aria-label="Nahlásit">${icon('flagplus')}</button>
+      <button class="round flat navbar__more" data-act="expand" aria-label="Další volby">${icon('chevron')}</button>
     </div>
-    <div class="upcoming" id="navUp"></div>
     <div class="nav-actions">
-      <button class="${st.rally ? 'on' : ''}" data-act="rally">${icon('track')}Rally</button>
-      <button data-act="report">${icon('flagplus')}Hlásit</button>
-      <button data-act="share">${icon('share')}Sdílet</button>
-      <button data-act="hud">${icon('hud')}HUD</button>
-      ${st.sim ? `<button data-act="simspeed">${icon('sim')}Demo ×${st.simMult}</button>` : ''}
-    </div>`, 'nav');
-  lastUp = '';
-  if (st.navState) onNavUpdate(st.navState);
+      ${act('rally', 'track', 'Rally', st.rally)}
+      ${act('fuelahead', 'fuel', 'Pumpa po cestě')}
+      ${act('overview', 'route', 'Celá trasa')}
+      ${act('mute', S.muted ? 'mute' : 'volume', S.muted ? 'Ztlumeno' : 'Hlas', false)}
+      ${act('share', 'share', 'Sdílet příjezd')}
+      ${act('rec', 'trips', rec.active ? 'Nahrávám' : 'Nahrávat', rec.active)}
+      ${act('hud', 'hud', 'HUD')}
+      ${st.sim ? act('simspeed', 'sim', `Demo ×${st.simMult}`) : ''}
+    </div>`, 'nav', true);
+  if (s) onNavUpdate(s);
 }
 function onAlert(a) {
-  const ev = a.ev, R = a.rep && REPORTS.find(x => x.type === a.rep.type);
-  const title = a.kind === 'cam' ? `Radar${a.ms ? ' · ' + a.ms : ''}` : a.kind === 'secStart' ? `Úsekové měření${a.ms ? ' · ' + a.ms : ''}` : a.kind === 'secEnd' ? 'Konec úsekového měření'
-    : a.kind === 'bump' ? 'Zpomalovací práh' : R ? R.label : ev ? evName(ev) : kindName(a.kind);
-  const ic = a.kind === 'secStart' || a.kind === 'secEnd' ? 'speed' : R ? R.icon : KIND_ICON[a.kind] || 'hazard';
-  toast({ icon: ic, title, sub: a.d > 0 ? 'za ' + fmtDist(a.d) + (ev && ev.loc ? ' · ' + ev.loc : '') : '', danger: ['cam', 'police', 'accident', 'closure'].includes(a.kind) || (R && R.type === 'mcam'), ms: 6000 });
+  // radary, hlášení a události ukazuje karta nad rychloměrem, sem jen to, co tam není
+  if (a.kind === 'secEnd') toast({ icon: 'check', title: 'Konec úsekového měření', ms: 3000 });
+  else if (['hazard', 'works'].includes(a.kind) && a.ev) toast({ icon: KIND_ICON[a.kind] || 'hazard', title: evName(a.ev), sub: 'za ' + fmtDist(a.d) + (a.ev.loc ? ' · ' + a.ev.loc : ''), ms: 5000 });
 }
 function onOver() {
   voice.say(voice.phraseAlert('over', 0), { priority: 2 });
@@ -822,6 +1173,7 @@ function renderArrive() {
       <div class="stat"><b>${r.a.notes.length}</b><span>zatáček v rozpisu</span></div>
     </div>
     <div class="go-row"><button class="btn" data-act="end">${icon('check')} Hotovo</button><button class="btn ghost" data-act="parksave">${icon('parking')} Tady parkuju</button></div>`, 'nav');
+  toggleSheet(true); showHazard(null); clearAsk();
 }
 async function endNav() {
   st.sim && st.sim.stop(); st.sim = null;
@@ -829,7 +1181,7 @@ async function endNav() {
   voice.stop(); wake(false);
   if (rec.active && rec.auto) await stopRec();
   $('hud').hidden = true;
-  st.mode = 'home';
+  st.mode = 'home'; showHazard(null); clearAsk();
   cancelPlan();
   map.easeTo({ pitch: 0, bearing: 0, padding: homePad(), duration: 700, ...(st.pos ? { center: st.pos, zoom: 15 } : {}) });
   startAutoRefresh(() => [st.pos || map.getCenter().toArray()]);
@@ -929,33 +1281,79 @@ function renderJoy() {
 }
 
 // ---------- hlášení ----------
-const REPORTS = [
-  { type: 'police', label: 'Policie', say: 'hlášená policie', icon: 'police', min: 60 },
-  { type: 'mcam', label: 'Mobilní radar', say: 'hlášený mobilní radar', icon: 'cam', min: 90 },
-  { type: 'jam', label: 'Kolona', say: 'hlášená kolona', icon: 'jam', min: 40 },
-  { type: 'accident', label: 'Nehoda', say: 'hlášená nehoda', icon: 'accident', min: 60 },
-  { type: 'hazard', label: 'Překážka', say: 'překážka na silnici', icon: 'hazard', min: 60 },
-  { type: 'closure', label: 'Uzavírka', say: 'hlášená uzavírka', icon: 'closure', min: 240 },
-];
 // částečná uzavírka (pruh, kyvadlo) je jen omezení, ne zavřená silnice
 const evName = ev => ev.kind === 'closure' && !ev.full ? 'Omezení provozu' : kindName(ev.kind);
 const KIND_ICON = { accident: 'accident', jam: 'jam', closure: 'closure', works: 'works', hazard: 'hazard', info: 'info', police: 'police', cam: 'cam', bump: 'bump', report: 'flag' };
 function openReport() {
-  page('Co je na silnici?', `
-    <div class="report-grid">${REPORTS.map(r => `<button data-act="rep" data-v="${r.type}">${icon(r.icon)}${r.label}</button>`).join('')}</div>
-    <p class="note-text">Hlášení se uloží na místo, kde právě jste, a po čase samo zmizí. Zatím zůstávají jen v tomto telefonu — sdílení mezi řidiči přidáme se serverem.</p>`);
+  modal(`<div class="modal__head"><b>Co je na silnici?</b><span>${st.pos ? 'Nahlásí se tam, kde právě jste.' : 'Nejdřív potřebuju znát vaši polohu.'}</span></div>
+    <div class="report-grid">${REPORT_TYPES.map(r => `<button data-act="rep" data-v="${r.type}" class="rep rep-${r.type}" ${st.pos ? '' : 'disabled'}><span class="rep__ic">${icon(r.icon)}</span><b>${r.label}</b></button>`).join('')}</div>
+    <p class="note-text">Hlášení uvidí i ostatní řidiči s touto navigací. Samo zmizí, když ho nikdo nepotvrdí.</p>`);
 }
-function addReport(type) {
-  const R = REPORTS.find(r => r.type === type), p = st.pos || map.getCenter().toArray();
-  reports.push({ id: 'r' + Date.now(), type, label: R.say, lon: p[0], lat: p[1], t: Date.now(), exp: Date.now() + R.min * 60000 });
-  saveReports(reports); drawReports();
-  st.nav && st.nav.setReports(reports);
-  closePage();
-  toast({ icon: R.icon, title: 'Díky, nahlášeno', sub: `${R.label} · zmizí za ${R.min} min` });
+async function addReportUI(type) {
+  closeModal();
+  const R = reportType(type);
+  if (!st.pos) { toast({ icon: 'locate', title: 'Poloha zatím není známá' }); return; }
+  navigator.vibrate && navigator.vibrate(20);
+  toast({ icon: R.icon, title: 'Díky, nahlášeno', sub: R.label, ms: 2500 });
+  const res = await postReport(type, st.pos, st.heading);
+  toast(res.shared
+    ? { icon: 'check', title: res.merged ? 'Potvrdili jste hlášení' : 'Sdíleno s řidiči', sub: `${R.label} · platí ${R.min} min` }
+    : { icon: 'info', title: 'Uloženo jen v telefonu', sub: /15|limit|rate/i.test(res.error || '') ? 'Moc hlášení za hodinu, zkuste to později.' : 'Server teď nejde.' });
+}
+function openRepInfo(r) {
+  const R = reportType(r.type) || REPORT_TYPES[0];
+  modal(`<div class="modal__head row-head"><span class="rep__ic big rep-${r.type}">${icon(R.icon)}</span><div><b>${R.label}</b><span>nahlášeno ${ago(r.t)}${r.up > 1 ? ` · potvrdilo ${r.up} řidičů` : ''}${st.pos ? ' · ' + fmtDist(dist(st.pos, [r.lon, r.lat])) + ' odsud' : ''}</span></div></div>
+    ${canVote(r.id) ? `<div class="btn-pair"><button class="btn" data-act="vote" data-id="${esc(r.id)}" data-v="1">${icon('check')} Pořád tam je</button><button class="btn ghost" data-act="vote" data-id="${esc(r.id)}" data-v="-1">${icon('close')} Už tam není</button></div>`
+    : `<p class="note-text">${r.mine ? 'Tohle hlášení je vaše.' : 'Díky, už jste hlasovali.'}</p>`}`);
 }
 function drawReports() {
   reports = reports.filter(r => r.exp > Date.now());
-  setData('reports', fc(reports.map(r => point([r.lon, r.lat], { type: r.type, t: r.t }))));
+  setData('reports', fc(reports.map(r => point([r.lon, r.lat], { type: r.type, t: r.t, id: String(r.id) }))));
+}
+// pumpa podél trasy před námi (max ~600 m od trasy), pak přepočet přes ni
+let fuelList = [];
+async function fuelAhead() {
+  const r = st.navRoute, s0 = st.nav ? st.nav.s : 0;
+  if (!r) return;
+  page('Pumpa po cestě', `<div class="progress"><span class="spinner"></span>Hledám pumpy podél trasy…</div>`);
+  pageRender = null;
+  const found = new Map();
+  try {
+    for (const [a, b] of [[1500, 20000], [20000, 45000], [45000, 80000]]) {
+      if (a >= r.length - s0) break;
+      const pts = [];
+      for (let s = s0 + a; s <= Math.min(r.length, s0 + b); s += 1000) pts.push(pointAt(r.coords, r.cum, s));
+      const xs = pts.map(p => p[0]), ys = pts.map(p => p[1]);
+      const list = await nomBox('[fuel]', [Math.min(...xs) - 0.01, Math.max(...ys) + 0.01, Math.max(...xs) + 0.01, Math.min(...ys) - 0.01], 50);
+      for (const p of list) {
+        const pr = project(r.coords, r.cum, [p.lon, p.lat]);
+        if (pr.d < 600 && pr.s > s0 + 800) found.set(p.lon + ',' + p.lat, { ...p, name: p.name || 'Čerpací stanice', s: pr.s, off: pr.d });
+      }
+      if (found.size >= 4) break;
+      await sleep(1000);
+    }
+    if ($('page').hidden || $('pageTitle').textContent !== 'Pumpa po cestě') return;
+    fuelList = [...found.values()].sort((x, y) => x.s - y.s).slice(0, 8);
+    $('pageBody').innerHTML = fuelList.length
+      ? `<div class="list">${fuelList.map((p, i) => `<button class="row" data-act="fuelvia" data-i="${i}">${icon('fuel')}<div class="row__t"><b>${esc(p.name)}</b><span>${p.off < 120 ? 'přímo u trasy' : 'odbočka ' + fmtDist(p.off)}${p.sub ? ' · ' + esc(p.sub) : ''}</span></div><span class="row__end">za ${fmtDist(p.s - s0)}</span></button>`).join('')}</div><p class="note-text">Po výběru přepočítám trasu přes pumpu a pak dál do cíle.</p>`
+      : `<div class="empty"><b>Na trase nic</b>V příštích kilometrech u trasy žádnou pumpu nevidím.</div>`;
+    hydrateIcons($('pageBody'));
+  } catch {
+    $('pageBody').innerHTML = `<div class="empty"><b>Hledání nejde</b>Zkontrolujte připojení k internetu.</div>`;
+  }
+}
+async function fuelVia(p) {
+  closePage();
+  if (!st.nav || !st.pos) return;
+  toast({ icon: 'fuel', title: 'Jedeme přes pumpu', sub: p.name, ms: 2500 });
+  try {
+    st.navStops.unshift({ name: p.name, lon: p.lon, lat: p.lat });
+    const r = await reroute(st.pos, st.heading, restStops(), prefs());
+    if (!st.nav) return;
+    st.navRoute = r; st.nav.setRoute(r, reports);
+    setData('routes', fc([line(r.coords, { sel: 1, idx: 0 })])); setData('routeJam', jamFeatures(r));
+    voice.say(`Trasa vede přes pumpu ${p.name}.`, { priority: 2 });
+  } catch { st.navStops.shift(); toast({ icon: 'info', title: 'Přepočet nevyšel', danger: true }); }
 }
 
 // ---------- vrstvy ----------
@@ -976,12 +1374,12 @@ function openLayers() {
     const pk = parking.get();
     page('Mapa', `
       <div class="group"><span class="label">Vzhled</span>${themeCards()}</div>
-      <div class="group"><span class="label">Na mapě</span><div class="layer-grid">${lb('showTraffic', 'jam', 'Doprava')}${lb('showCams', 'cam', 'Radary a úsekovky')}${lb('showBumps', 'bump', 'Zpomalovací prahy')}</div></div>
+      <div class="group"><span class="label">Na mapě</span><div class="layer-grid">${lb('showTraffic', 'jam', 'Doprava')}${lb('showCams', 'cam', 'Radary a úsekovky')}${lb('showBumps', 'bump', 'Zpomalovací prahy')}${lb('relief', 'view', 'Reliéf terénu')}</div></div>
       <div class="group"><span class="label">Parkování</span><div class="card">
         <button class="row" data-act="parksave">${icon('parking')}<div class="row__t"><b>Zapamatovat, kde stojím</b><span>${pk ? 'naposledy ' + ago(pk.t) : 'auto pak snadno najdete'}</span></div></button>
         ${pk ? `<button class="row" data-act="parkshow">${icon('pin')}<div class="row__t"><b>Ukázat auto na mapě</b><span>${st.pos ? fmtDist(dist(st.pos, [pk.lon, pk.lat])) + ' odsud' : ''}</span></div></button>` : ''}
       </div></div>
-      <p class="note-text">Doprava: Národní dopravní informační centrum (NDIC), obnova každou minutu. Radary, úsekovky a prahy: OpenStreetMap. Mapa: OpenFreeMap.</p>`);
+      <p class="note-text">Doprava: Národní dopravní informační centrum (NDIC), obnova každou minutu. Radary, úsekovky a prahy: OpenStreetMap. Hlášení: řidiči s touto navigací. Mapa: OpenFreeMap, reliéf: Mapzen.</p>`);
   };
   pageRender = draw; draw();
 }
@@ -994,7 +1392,7 @@ async function openTrips() {
   let list = [];
   try { list = await trips.all(); } catch { }
   if (!list.length) {
-    $('pageBody').innerHTML = `<div class="empty"><b>Zatím žádné jízdy</b>Nahrávání spustíte tlačítkem s červenou tečkou vpravo, nebo ho v Nastavení zapněte pro každou navigaci.</div>`;
+    $('pageBody').innerHTML = `<div class="empty"><b>Zatím žádné jízdy</b>Nahrávání spustíte na úvodní obrazovce tlačítkem Nahrát, nebo ho v Nastavení zapněte pro každou jízdu.</div>`;
     return;
   }
   const km = list.reduce((a, t) => a + t.dist, 0) / 1000;
@@ -1059,12 +1457,16 @@ function download(name, text, type) {
 }
 function startRec(auto = false) {
   rec.start(); rec.auto = auto;
-  $('recBtn').classList.add('on');
-  toast({ icon: 'trips', title: 'Nahrávám jízdu', sub: auto ? 'automaticky během navigace' : 'zastavíte stejným tlačítkem' });
+  clearInterval(recTimer); recTimer = setInterval(renderStatus, 1000);
+  renderStatus(); refreshModeSheet();
+  toast({ icon: 'trips', title: 'Nahrávám jízdu', sub: auto ? 'automaticky' : 'zastavíte klepnutím na čas nahoře' });
+}
+function refreshModeSheet() {
+  if (st.mode === 'home') renderHome(); else if (st.mode === 'drive') renderDrive(); else if (st.mode === 'nav' && !st.arrived) renderNav();
 }
 async function stopRec() {
   const t = await rec.stop();
-  $('recBtn').classList.remove('on');
+  clearInterval(recTimer); renderStatus(); refreshModeSheet();
   if (t) toast({ icon: 'check', title: 'Jízda uložena', sub: `${fmtDist(t.dist)} · max ${Math.round(t.max)} km/h` });
   else toast({ icon: 'info', title: 'Jízda byla moc krátká, neukládám' });
 }
@@ -1104,6 +1506,7 @@ function openSettings() {
         ${sw('warnTraffic', 'Kolony, nehody, uzavírky')}
         ${sw('warnOver', 'Překročení rychlosti')}
         ${sw('voiceAlerts', 'Upozornění i hlasem')}
+        ${sw('driveAlerts', 'Hlídat i při jízdě bez cíle', 'Rozjedete se bez trasy a navigace sama hlásí, co je před vámi')}
       </div><div style="margin-top:10px"><span class="label">Tolerance překročení</span><div style="margin-top:8px">${seg('overTol', [[0, '0'], [5, '+5'], [10, '+10'], [15, '+15']])}</div></div></div>
       <div class="group"><span class="label">Jak jezdím</span>
         ${seg('tempo', [[0.95, 'V limitu'], [1, 'S provozem'], [1.08, 'Svižně']])}
@@ -1128,6 +1531,7 @@ function afterSetting(k) {
   if (k === 'muted' && S.muted) voice.stop();
   if (['showTraffic', 'showCams', 'showBumps'].includes(k)) applyVisibility();
   if (k === 'theme' || k === 'autoNight') applyTheme();
+  if (k === 'relief') map.setStyle(buildStyle(st.theme, S.relief), { diff: false });
   if (k === 'avoidHighways' && st.mode === 'plan') plan();
   if (['tempo', 'learnTempo', 'sport'].includes(k) && (st.mode === 'plan' || st.mode === 'joy')) reanalyze();
   if (k === 'rally' && st.mode !== 'nav') st.rally = S.rally;
@@ -1156,10 +1560,28 @@ const ACT = {
   go: () => startNav(st.selR),
   sim: () => startNav(st.selR, { sim: true }),
   end: endNav,
-  mute: () => { S.muted = !S.muted; afterSetting('muted'); renderNav(); },
-  rally: () => { st.rally = !st.rally; renderNav(); voice.say(st.rally ? 'Rally rozpis zapnut.' : 'Rally rozpis vypnut.', { priority: 2 }); },
+  mute: () => { S.muted = !S.muted; afterSetting('muted'); refreshModeSheet(); toast({ icon: S.muted ? 'mute' : 'volume', title: S.muted ? 'Hlas ztlumen' : 'Hlas zapnut', ms: 1800 }); },
+  rally: () => { st.rally = !st.rally; renderNav(); if (!st.rally) $('pace').hidden = true; voice.say(st.rally ? 'Rally rozpis zapnut.' : 'Rally rozpis vypnut.', { priority: 2 }); },
   report: openReport,
-  rep: d => addReport(d.v),
+  rep: d => addReportUI(d.v),
+  vote: d => {
+    const r = reports.find(x => String(x.id) === d.id) || (st.ask && String(st.ask.id) === d.id ? st.ask : null);
+    voteReport(r ? r.id : d.id, +d.v); clearAsk(); closeModal();
+    toast({ icon: 'check', title: 'Díky!', sub: +d.v > 0 ? 'Hlášení zůstane déle' : 'Hlášení zmizí', ms: 2500 });
+  },
+  search: () => openSearch('dest'),
+  settings: openSettings,
+  layers: openLayers,
+  geo: () => { geo.low = false; geo.boot = 0; startGPS(); renderGeo(); },
+  near: d => openNearby(d.k),
+  nearpick: d => { const p = nearList[+d.i]; if (!p) return; closePage(); if (st.mode === 'drive') exitDrive(true); goTo({ name: p.name, sub: p.sub, lon: p.lon, lat: p.lat }); },
+  rec: () => rec.active ? stopRec() : startRec(false),
+  recstop: () => rec.active && stopRec(),
+  driveend: () => exitDrive(true),
+  expand: () => toggleSheet(),
+  overview: () => { if (!st.navRoute) return; setFollow(false); map.easeTo({ pitch: 0, bearing: 0, duration: 400 }); setTimeout(() => fitRoutes([st.navRoute]), 420); toast({ icon: 'locate', title: 'Přehled trasy', sub: 'Zpátky na jízdu tlačítkem se šipkou vpravo', ms: 3500 }); },
+  fuelahead: fuelAhead,
+  fuelvia: d => fuelList[+d.i] && fuelVia(fuelList[+d.i]),
   share: shareEta,
   hud: openHud,
   simspeed: () => { st.simMult = st.simMult === 1 ? 2 : st.simMult === 2 ? 4 : 1; if (st.sim) st.sim.mult = st.simMult; renderNav(); },
@@ -1203,17 +1625,18 @@ function onAct(e) {
   f && f(b.dataset, b);
 }
 sheetBody.addEventListener('click', onAct);
+$('modalCard').addEventListener('click', onAct);
+$('dash').addEventListener('click', onAct);
+$('status').addEventListener('click', onAct);
 $('pageBody').addEventListener('click', e => { const t = e.target.closest('[data-act="test"]'); if (t) { e.stopPropagation(); ACT.test(t.dataset); return; } onAct(e); });
 
-$('searchOpen').onclick = () => openSearch('dest');
-$('settingsOpen').onclick = openSettings;
 $('layersBtn').onclick = openLayers;
 $('reportBtn').onclick = openReport;
-$('recBtn').onclick = () => rec.active ? stopRec() : startRec(false);
 $('locBtn').onclick = () => {
   if (!st.pos) { toast({ icon: 'locate', title: 'Čekám na polohu…', sub: 'Venku pod širým nebem to jde rychleji.' }); return; }
   setFollow(true);
   if (st.mode === 'nav' && st.navState) onNavUpdate(st.navState);
+  else if (st.mode === 'drive') map.easeTo({ center: st.pos, zoom: 16, pitch: 50, bearing: st.heading || 0, padding: drivePad(), duration: 700 });
   else map.easeTo({ center: st.pos, zoom: Math.max(map.getZoom(), 15), bearing: 0, pitch: 0, duration: 700, padding: homePad() });
 };
 document.addEventListener('pointerdown', () => voice.unlock(), { once: true });
@@ -1228,10 +1651,16 @@ loadData().then(() => {
   waitBumps();
 }).catch(e => console.warn('data', e));
 drawReports();
+shared.onChange = list => {
+  reports = list; drawReports();
+  st.nav && st.nav.setReports && st.nav.setReports(reports);
+  const m = $('homeMeta'); if (m) m.textContent = trafficMeta();
+};
+startReportSync();
 traffic.onChange = () => {
   const g = trafficGeoJSON();
   setData('flow', g.flow); setData('tlines', g.lines); setData('tevents', g.events);
-  if (st.mode === 'home') { const m = sheetBody.querySelector('.hello .meta'); if (m) m.textContent = trafficMeta(); }
+  { const m = $('homeMeta'); if (m) m.textContent = trafficMeta(); }
   if (st.mode === 'nav' && st.navRoute && st.navRoute.edges !== undefined) {
     const notes = st.navRoute.a.notes;
     st.navRoute.a = analyze(st.navRoute, st.navRoute.edges, prefs());
@@ -1241,4 +1670,4 @@ traffic.onChange = () => {
 startAutoRefresh(() => [st.pos || map.getCenter().toArray()]);
 setInterval(() => { applyTheme(); drawReports(); }, 60000);
 if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => { });
-window.__nav = { st, map, plan, goTo, startNav };
+window.__nav = { st, map, plan, goTo, startNav, handleFix, enterDrive, askVote, setGeo };

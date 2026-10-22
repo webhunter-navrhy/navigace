@@ -1,14 +1,14 @@
 // Nastavení, místa, historie (localStorage) a nahrané jízdy (IndexedDB).
 const LS = 'navigace:';
-const read = (k, d) => { try { const v = localStorage.getItem(LS + k); return v ? JSON.parse(v) : d; } catch { return d; } };
-const write = (k, v) => { try { localStorage.setItem(LS + k, JSON.stringify(v)); } catch { } };
+export const read = (k, d) => { try { const v = localStorage.getItem(LS + k); return v ? JSON.parse(v) : d; } catch { return d; } };
+export const write = (k, v) => { try { localStorage.setItem(LS + k, JSON.stringify(v)); } catch { } };
 
 export const DEFAULTS = {
   theme: 'pulnoc', persona: 'navigatorka', voiceURI: null, volume: 1, muted: false,
   priority: 'fast', avoidHighways: false, tempo: 1, learnTempo: true,
   warnCams: true, warnBumps: true, warnTraffic: true, warnOver: true, overTol: 5, voiceAlerts: true,
   rally: false, rallyPersona: true, showTraffic: true, showCams: true, showBumps: false, autoNight: false,
-  hud: false, record: false, sport: false,
+  hud: false, record: false, sport: false, relief: true, driveAlerts: true,
 };
 export const settings = { ...DEFAULTS, ...read('settings', {}) };
 export const saveSettings = () => write('settings', settings);
@@ -40,6 +40,8 @@ export function loadReports() {
   return read('reports', []).filter(r => r.exp > now);
 }
 export function saveReports(list) { write('reports', list); }
+// poslední známá poloha → aplikace se otevře hned na správném místě
+export const lastPos = { get: () => read('lastpos', null), set: p => write('lastpos', p) };
 export const parking = { get: () => read('parking', null), set: p => write('parking', p) };
 export const onboard = { get: () => read('onboarded', false), set: () => write('onboarded', true) };
 

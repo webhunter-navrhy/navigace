@@ -54,14 +54,15 @@ function roadLayers(c) {
   return L;
 }
 
-export function buildStyle(themeId) {
-  const c = THEMES[themeId].map;
+export function buildStyle(themeId, relief = true) {
+  const c = THEMES[themeId].map, sh = c.shade;
   return {
     version: 8,
     name: 'navigace-' + themeId,
     glyphs: 'https://tiles.openfreemap.org/fonts/{fontstack}/{range}.pbf',
     sources: {
       omt: { type: 'vector', url: 'https://tiles.openfreemap.org/planet', attribution: '© <a href="https://openfreemap.org">OpenFreeMap</a> © <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>' },
+      ...(relief ? { dem: { type: 'raster-dem', tiles: ['https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png'], encoding: 'terrarium', tileSize: 256, maxzoom: 12, attribution: 'Terén: Mapzen' } } : {}),
     },
     layers: [
       { id: 'bg', type: 'background', paint: { 'background-color': c.bg } },
@@ -70,6 +71,10 @@ export function buildStyle(themeId) {
       { id: 'landuse', type: 'fill', source: 'omt', 'source-layer': 'landuse', minzoom: 8,
         paint: { 'fill-color': ['match', ['get', 'class'], ['industrial', 'commercial', 'retail', 'railway'], c.industrial, ['cemetery', 'pitch', 'stadium', 'playground'], c.grass, c.residential], 'fill-opacity': ['interpolate', ['linear'], ['zoom'], 8, 0.5, 12, 0.9] } },
       { id: 'park', type: 'fill', source: 'omt', 'source-layer': 'park', paint: { 'fill-color': c.grass, 'fill-opacity': 0.8 } },
+      // reliéf: kopce a údolí zdálky, po přiblížení se vytratí, ať neruší silnice
+      ...(relief ? [{ id: 'relief', type: 'hillshade', source: 'dem', maxzoom: 15.5,
+        paint: { 'hillshade-shadow-color': sh.shadow, 'hillshade-highlight-color': sh.light, 'hillshade-accent-color': sh.accent,
+          'hillshade-exaggeration': ['interpolate', ['linear'], ['zoom'], 6, sh.k, 11, sh.k * 0.75, 15, 0.08], 'hillshade-illumination-direction': 315 } }] : []),
       { id: 'waterway', type: 'line', source: 'omt', 'source-layer': 'waterway', minzoom: 9,
         paint: { 'line-color': c.waterLine, 'line-width': w([[9, 0.4], [14, 1.6], [18, 5]]) } },
       { id: 'water', type: 'fill', source: 'omt', 'source-layer': 'water', paint: { 'fill-color': c.water } },
@@ -89,10 +94,9 @@ export function buildStyle(themeId) {
         filter: ['match', ['get', 'class'], ['primary', 'secondary', 'tertiary', 'minor', 'residential', 'unclassified', 'trunk'], true, false],
         layout: { 'symbol-placement': 'line', 'text-field': NAME, 'text-font': F_REG, 'text-size': w([[13, 10], [17, 13]]), 'text-max-angle': 30 },
         paint: { 'text-color': c.roadLabel, 'text-halo-color': c.halo, 'text-halo-width': 1.4 } },
-      { id: 'road-shield', type: 'symbol', source: 'omt', 'source-layer': 'transportation_name', minzoom: 8,
-        filter: ['all', ['has', 'ref'], ['match', ['get', 'class'], ['motorway', 'trunk', 'primary'], true, false]],
-        layout: { 'symbol-placement': 'line', 'symbol-spacing': 400, 'text-field': ['get', 'ref'], 'text-font': F_BOLD, 'text-size': 10, 'text-rotation-alignment': 'viewport' },
-        paint: { 'text-color': c.labelStrong, 'text-halo-color': c.road.motorway, 'text-halo-width': 3 } },
+      { id: 'housenumber', type: 'symbol', source: 'omt', 'source-layer': 'housenumber', minzoom: 17,
+        layout: { 'text-field': ['get', 'housenumber'], 'text-font': F_REG, 'text-size': 10 },
+        paint: { 'text-color': c.roadLabel, 'text-halo-color': c.halo, 'text-halo-width': 1 } },
       { id: 'place-minor', type: 'symbol', source: 'omt', 'source-layer': 'place', minzoom: 11,
         filter: ['match', ['get', 'class'], ['village', 'hamlet', 'suburb', 'neighbourhood', 'quarter'], true, false],
         layout: { 'text-field': NAME, 'text-font': F_REG, 'text-size': w([[11, 10], [16, 14]]) },

@@ -16,6 +16,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="preconnect" href="https://tiles.openfreemap.org" crossorigin>
+<link rel="preconnect" href="https://navigace-api.webhunter.workers.dev" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:ital,wght@0,500;0,600;0,700;1,600;1,700;1,800&family=Barlow:wght@400;500;600&family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,500;1,9..144,400&family=Geist:wght@300;400;500;600&family=Instrument+Serif:ital@0;1&family=Plus+Jakarta+Sans:wght@400;500;600&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/maplibre-gl@4.7.1/dist/maplibre-gl.css">
 <link rel="stylesheet" href="css/app.css?v=__V__">
@@ -24,14 +25,8 @@
 <div id="map" aria-label="Mapa"></div>
 
 <div id="ui">
-  <!-- horní lišta (prohlížení) -->
-  <header class="top" id="top">
-    <button class="search-pill" id="searchOpen" aria-label="Hledat cíl">
-      <span class="ico" data-i="search"></span>
-      <span class="search-pill__text">Kam jedeme?</span>
-    </button>
-    <button class="round" id="settingsOpen" aria-label="Nastavení"><span class="ico" data-i="sliders"></span></button>
-  </header>
+  <!-- stav nahoře: nahrávání, poloha -->
+  <div class="status" id="status" hidden></div>
 
   <!-- manévr (navigace) -->
   <section class="maneuver" id="maneuver" hidden>
@@ -53,16 +48,18 @@
 
   <!-- pravý panel tlačítek -->
   <nav class="rail" id="rail">
-    <button class="round" id="layersBtn" aria-label="Vrstvy"><span class="ico" data-i="layers"></span></button>
+    <button class="round" id="layersBtn" aria-label="Mapa a vrstvy"><span class="ico" data-i="layers"></span></button>
     <button class="round" id="reportBtn" aria-label="Nahlásit"><span class="ico" data-i="flagplus"></span></button>
-    <button class="round rec" id="recBtn" aria-label="Nahrávat jízdu"><span class="rec__dot"></span></button>
     <button class="round" id="locBtn" aria-label="Moje poloha"><span class="ico" data-i="locate"></span></button>
   </nav>
 
-  <!-- rychlost + limit -->
-  <div class="speedo" id="speedo">
-    <div class="limit" id="limitSign" hidden><span id="limitVal">50</span></div>
-    <div class="speed"><b id="speedVal">0</b><small>km/h</small></div>
+  <!-- co je před námi + rychlost a limit -->
+  <div class="dash" id="dash">
+    <div class="hazard" id="hazard" hidden></div>
+    <div class="speedo" id="speedo" hidden>
+      <div class="limit" id="limitSign" hidden><span id="limitVal">50</span></div>
+      <div class="speed"><b id="speedVal">0</b><small>km/h</small></div>
+    </div>
   </div>
 
   <!-- spodní panel -->
@@ -81,6 +78,11 @@
   </header>
   <div class="page__body" id="pageBody"></div>
 </section>
+
+<div class="modal" id="modal" hidden>
+  <div class="modal__scrim"></div>
+  <div class="modal__card" id="modalCard" role="dialog" aria-modal="true"></div>
+</div>
 
 <div class="hud" id="hud" hidden>
   <div class="hud__inner">
