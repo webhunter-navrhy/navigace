@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="cs" data-theme="pulnoc">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>Navigace</title>
+<meta name="description" content="Navigace pro Česko: chytré trasy podle zácp, radarů a zatáček, rally hlášení, joy ride a nahrávání jízd.">
+<meta name="theme-color" content="#0c0e12">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Navigace">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="preconnect" href="https://tiles.openfreemap.org" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:ital,wght@0,500;0,600;0,700;1,600;1,700;1,800&family=Barlow:wght@400;500;600&family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,500;1,9..144,400&family=Geist:wght@300;400;500;600&family=Instrument+Serif:ital@0;1&family=Plus+Jakarta+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/maplibre-gl@4.7.1/dist/maplibre-gl.css">
+<link rel="stylesheet" href="css/app.css?v=__V__">
+</head>
+<body>
+<div id="map" aria-label="Mapa"></div>
+
+<div id="ui">
+  <!-- horní lišta (prohlížení) -->
+  <header class="top" id="top">
+    <button class="search-pill" id="searchOpen" aria-label="Hledat cíl">
+      <span class="ico" data-i="search"></span>
+      <span class="search-pill__text">Kam jedeme?</span>
+    </button>
+    <button class="round" id="settingsOpen" aria-label="Nastavení"><span class="ico" data-i="sliders"></span></button>
+  </header>
+
+  <!-- manévr (navigace) -->
+  <section class="maneuver" id="maneuver" hidden>
+    <div class="maneuver__main">
+      <div class="maneuver__arrow" id="manArrow"></div>
+      <div class="maneuver__body">
+        <div class="maneuver__dist" id="manDist">—</div>
+        <div class="maneuver__text" id="manText"></div>
+      </div>
+    </div>
+    <div class="maneuver__next" id="manNext" hidden></div>
+  </section>
+
+  <!-- rally rozpis -->
+  <section class="pace" id="pace" hidden></section>
+
+  <!-- upozornění -->
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+  <!-- pravý panel tlačítek -->
+  <nav class="rail" id="rail">
+    <button class="round" id="layersBtn" aria-label="Vrstvy"><span class="ico" data-i="layers"></span></button>
+    <button class="round" id="reportBtn" aria-label="Nahlásit"><span class="ico" data-i="flagplus"></span></button>
+    <button class="round rec" id="recBtn" aria-label="Nahrávat jízdu"><span class="rec__dot"></span></button>
+    <button class="round" id="locBtn" aria-label="Moje poloha"><span class="ico" data-i="locate"></span></button>
+  </nav>
+
+  <!-- rychlost + limit -->
+  <div class="speedo" id="speedo">
+    <div class="limit" id="limitSign" hidden><span id="limitVal">50</span></div>
+    <div class="speed"><b id="speedVal">0</b><small>km/h</small></div>
+  </div>
+
+  <!-- spodní panel -->
+  <section class="sheet" id="sheet">
+    <button class="sheet__grip" id="sheetGrip" aria-label="Rozbalit"><i></i></button>
+    <div class="sheet__body" id="sheetBody"></div>
+  </section>
+</div>
+
+<!-- celoobrazovkové vrstvy -->
+<section class="page" id="page" hidden>
+  <header class="page__head">
+    <button class="round flat" id="pageBack" aria-label="Zpět"><span class="ico" data-i="back"></span></button>
+    <h2 class="page__title" id="pageTitle"></h2>
+    <span></span>
+  </header>
+  <div class="page__body" id="pageBody"></div>
+</section>
+
+<div class="hud" id="hud" hidden>
+  <div class="hud__inner">
+    <div class="hud__speed" id="hudSpeed">0</div>
+    <div class="hud__man" id="hudMan"></div>
+    <div class="hud__dist" id="hudDist"></div>
+  </div>
+  <button class="hud__close" id="hudClose">Zavřít HUD</button>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<script type="module" src="js/app.js?v=__V__"></script>
+</body>
+</html>
